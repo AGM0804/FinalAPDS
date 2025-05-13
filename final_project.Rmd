@@ -737,3 +737,253 @@ cat("RMSE:", round(rmse_val, 4), "\n")
 cat("MAE :", round(mae_val, 4), "\n")
 cat("R²  :", round(r2_val, 4), "\n")
 ```
+Теперь давайте создадим интефейс и сервер для приложения, для этого сохраним модель линейной регерссии, которая будет использоваться для пердсказания
+```{r}
+save(model, file = "lm.Rda")
+```
+Далее код для интефеса и сервера приложения
+```{r}
+library(shiny)
+library(utils)
+library(shinyWidgets)
+library(tidymodels)
+library(shinythemes)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+
+
+load("lm.Rda") 
+
+
+data = read.csv("student_lifestyle.csv")
+data = data %>% mutate(Stress_Level_num = case_when(
+    Stress_Level == "Low"    ~ 0,
+    Stress_Level == "Moderate" ~ 1,
+    Stress_Level == "High"   ~ 2,
+    TRUE ~ NA_real_
+  ))
+data = data %>% relocate(GPA, .after = last_col())
+data$GPA = data$GPA * 2.5
+means = data %>% dplyr::select(-Student_ID, -GPA)
+means = data %>% summarise(Study_Hours_Per_Day = mean(Study_Hours_Per_Day),
+                           Extracurricular_Hours_Per_Day = mean(Extracurricular_Hours_Per_Day),
+                           Sleep_Hours_Per_Day = mean(Sleep_Hours_Per_Day),
+                           Stress_Level = names(sort(table(Stress_Level), decreasing = T))[1])
+
+
+ui <- fluidPage(
+  theme = shinytheme("flatly"),
+  titlePanel("🎓 SmartStudent Advisor"),
+  sidebarLayout(
+    sidebarPanel(
+      conditionalPanel('input.show === "Предсказание"',
+                       h4("🧮 Введите данные (оставьте пустым — будет использовано среднее значение)"),
+                       
+                       sliderInput("study", "📘 Study Hours Per Day", value = round(means$Study_Hours_Per_Day, 1), min = 0, max = 24, step = 0.1),
+                       helpText("Учеба.Например: 5.5"),
+                       
+                       sliderInput("extra", "🎨 Extracurricular Hours Per Day",  value = round(means$Extracurricular_Hours_Per_Day, 1), min = 0, max = 24, step = 0.1),
+                       helpText("Участие в кружках, клубах. Например: 1.5"),
+                       
+                       sliderInput("sleep", "😴 Sleep Hours Per Day",  value = round(means$Sleep_Hours_Per_Day, 1), min = 0, max = 24, step = 0.1),
+                       helpText("Сон в часах, например: 7.8"),
+                       
+                       selectInput("stress", "😬 Stress Level", choices = c("", "Low", "Moderate", "High"), selected = means$Stress_Level),
+                       helpText("Выберите уровень стресса"),
+                       
+                       actionButton("predict", "🔮 Предсказать GPA и определить тип"), 
+                       actionBttn("reset","По умолчанию",color = "default", size = "sm")),
+      
+      conditionalPanel('input.show === "Графики"',
+                     h4("🧮 Выберете характеристики"),
+                     
+                     sliderInput("study1", "📘 Study Hours Per Day", value = c(0,24), min = 0, max = 24, step = 0.1),
+                     helpText("Учеба.Например: 5.5 - 6.5"),
+                     
+                     sliderInput("extra1", "🎨 Extracurricular Hours Per Day",  value = c(0,24), min = 0, max = 24, step = 0.1),
+                     helpText("Участие в кружках, клубах. Например: 1.5"),
+                     
+                     sliderInput("sleep1", "😴 Sleep Hours Per Day",  value = c(0,24), min = 0, max = 24, step = 0.1),
+                     helpText("Сон в часах, например: 7.8 - 10"),
+                     
+                     selectInput("stress1", "😬 Stress Level", choices = c("", "Low", "Moderate", "High"), 
+                                 selected = "High", multiple = T),
+                     helpText("Выберите уровень стресса"), 
+                     
+                     actionBttn("reset1","По умолчанию",color = "default", size = "sm"))
+      ),
+    mainPanel(
+      tabsetPanel(id = "show",
+                  tabPanel("Предсказание",
+                             h3("📊 Результаты"), verbatimTextOutput("check"), htmlOutput("gpa_output"),
+                           htmlOutput("advice"), htmlOutput("warning")),
+                  tabPanel("Графики",
+                           plotlyOutput("combined_graph", height = "600px")))
+    )
+  )
+)
+
+
+server <- function(input, output, session) {
+  
+  #Создаем файл для логов
+  log_file <- "prediction_logs.csv"
+  if (!file.exists(log_file)) {
+    write.csv(data.frame(
+      Timestamp = character(),
+      Study_Hours = numeric(),
+      Extracurricular_Hours = numeric(),
+
+
+Sleep_Hours = numeric(),
+      Stress_Level = character(),
+      Predicted_GPA = numeric(),
+      stringsAsFactors = FALSE
+    ), log_file, row.names = FALSE)
+  }
+  
+  observeEvent(input$predict, {
+    hours = input$study + input$extra + input$sleep
+    if(hours > 24){
+      output$warning<- renderUI({
+        HTML(paste("<font size = '6', color = 'red'>", "⚠️", "Некорректный ввод характеристик.", "<br>",
+                   "<font size = '2', , color = 'gray'>",
+                   "Пожалуйста, проверьте, что числовые характеристики в сумме составляют не более 24 часов."))
+        })
+    }
+    else{#графики и предсказание
+      #Вставляем предсказание (но так как были манипуляции с уровнем стресса при построении модели, приобразуем уровни сначала в числовой формат, а потом в факторы)
+      # Преобразуем уровень стресса в число
+      stress_num <- dplyr::case_when(
+        input$stress == "Low" ~ 0,
+        input$stress == "Moderate" ~ 1,
+        input$stress == "High" ~ 2,
+        TRUE ~ NA_real_
+      )
+      stress_num <- factor(stress_num, levels = c(0, 1, 2), ordered = TRUE)
+      
+      # Собираем данные в data.frame
+      new_data <- data.frame(
+        Study_Hours_Per_Day = input$study,
+        Extracurricular_Hours_Per_Day = input$extra,
+        Sleep_Hours_Per_Day = input$sleep,
+        Stress_Level = stress_num
+      )
+      # Предсказание GPA
+      pred_gpa <- predict(model, newdata = new_data)
+      
+      # Логгирование
+      log_entry <- data.frame(
+        Timestamp = Sys.time(),
+        Study_Hours = input$study,
+        Extracurricular_Hours = input$extra,
+        Sleep_Hours = input$sleep,
+        Stress_Level = input$stress,
+        Predicted_GPA = as.numeric(pred_gpa)
+      )
+      
+      write.table(log_entry, file = log_file, append = TRUE, sep = ",", col.names = FALSE, row.names = FALSE)
+      output$gpa_output <- renderUI({
+        gpa_value <- as.numeric(pred_gpa)
+        color <- if (gpa_value >= 8) "green" else if (gpa_value >= 4) "orange" else "red"
+        HTML(sprintf(
+          "<font size = '4'><b>🔮 Предсказанный GPA: <span style='color:%s; font-size: 24px;'>%.2f</span></b>", 
+          color, gpa_value
+        ))
+      })
+      output$advice <- renderUI({
+        HTML(paste("<br>", "<br>","<span style='color:%s; font-size: 24px;'>📈 Что может повлиять на GPA?</span>",
+                   "<br>", "<br>", "<font size = '4'>", "Согласно модели, сильнее всего на оценку влияет число",  "<b>", "учебных часов",
+                   "</b>", ". Оценка может повыситься с большей вероятностью, если проводить больше времени за учебой: каждый час,
+             посвященный учебе, имеет шанс", "<b>", "<span style='color: green;'>повысить</span>", "</b>", "средний балл на 0,38.",
+                   "<br>", "<br>",
+                   "Причем это касается времени, проведенного именно ", "<b>", "на занятиях", "</b>",
+                   ", т. к. внеурочные часы, согласно модели, могут", "<b>", "<span style='color: red;'>снизить</span>", "</b>",
+                   "средний балл на на 0,02."))
+      })
+      output$warning <- renderUI({NULL})
+    }
+      
+    })
+  
+  #Построение графиков
+  filtered_data <- reactive({
+    req(input$study1, input$extra1, input$sleep1)
+    df <- data %>%
+      filter(Study_Hours_Per_Day >= input$study1[1], Study_Hours_Per_Day <= input$study1[2],
+             Extracurricular_Hours_Per_Day >= input$extra1[1], Extracurricular_Hours_Per_Day <= input$extra1[2],
+             Sleep_Hours_Per_Day >= input$sleep1[1], Sleep_Hours_Per_Day <= input$sleep1[2])
+    if(length(input$stress1) > 0 && !("" %in% input$stress1)) {
+      df <- df %>% filter(Stress_Level %in% input$stress1)
+    }
+    df
+  })
+ 
+   output$combined_graph <- renderPlotly({
+    df <- filtered_data()
+    req(nrow(df) > 0)
+    
+    # Создаем гистограммы GPA для каждого признака с разными цветами
+    p <- plot_ly()
+    
+    # Гистограмма GPA для Study Hours
+    p <- add_histogram(p, x = df$GPA, name = "Часы учебы", 
+                       marker = list(color = 'blue'), opacity = 0.5,
+                       xbins = list(size =0.1),
+                       transforms = list(
+                         list(type = 'filter', target = df$Study_Hours_Per_Day,
+                              operation = '>=', value = input$study1[1]),
+                         list(type = 'filter', target = df$Study_Hours_Per_Day,
+                              operation = '<=', value = input$study1[2])
+                       ))
+    # Гистограмма GPA для Extracurricular Hours
+    p <- add_histogram(p, x = df$GPA, name = "Часы дополнительных активностей", 
+                       marker = list(color = 'darkgreen'), opacity = 0.5,
+                       xbins = list(size = 0.1))
+    # Гистограмма GPA для Sleep Hours
+    p <- add_histogram(p, x = df$GPA, name = "Часы сна", 
+                       marker = list(color = 'purple'), opacity = 0.5,
+                       xbins = list(size = 0.1))
+    
+    # Гистограмма GPA для Stress Level - здесь делаем разбиение по категориям стресса
+    
+    stress_levels <- unique(df$Stress_Level)
+    colors_stress <- c("Low" = "green", "Moderate" = "orange", "High" = "darkred")
+    for (lvl in stress_levels) {
+      df_sub <- df %>% filter(Stress_Level == lvl)
+      p <- add_histogram(p, x = df_sub$GPA, name = paste("Уровень стресса:", lvl),
+                         marker = list(color = colors_stress[lvl]), opacity = 0.5,
+                         xbins = list(size = 0.1))
+    }
+    p <- layout(p,
+                barmode = "overlay",
+                title = "Распределение GPA по выбранным характеристикам",
+                xaxis = list(title = "GPA"),
+                yaxis = list(title = "Частота"),
+                legend = list(title = list(text = "<b>Категории</b>")))
+    
+    p
+   })
+   
+  
+  observeEvent(input$reset, {
+    updateSliderInput(session, "study", value = round(means$Study_Hours_Per_Day, 1))
+    updateSliderInput(session, "extra", value = round(means$Extracurricular_Hours_Per_Day, 1))
+    updateSliderInput(session, "sleep", value = round(means$Sleep_Hours_Per_Day, 1))
+    updateSelectInput(session, "stress", selected = means$Stress_Level)
+  })
+  
+  observeEvent(input$reset1, {
+    updateSliderInput(session, "study1", value = round(means$Study_Hours_Per_Day, 1))
+    updateSliderInput(session, "extra1", value = round(means$Extracurricular_Hours_Per_Day, 1))
+    updateSliderInput(session, "sleep1", value = round(means$Sleep_Hours_Per_Day, 1))
+    updateSelectInput(session, "stress1", selected = means$Stress_Level)
+  })
+}
+
+
+shinyApp(ui = ui, server = server)
+
+```
+Ссылка: https://essozonova.shinyapps.io/app_GPA/ 
